@@ -1,0 +1,506 @@
+---
+title: "Reconciliação na produção de automóveis"
+author: "Robson"
+format: html
+editor: visual
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+library(tsibble)
+library(ggplot2)
+library(GGally)
+library(corrplot)
+library(knitr)
+library(dplyr)
+library(tidyr)
+library(fable)
+library(fabletools)
+library(fable.prophet)
+library(feasts)
+library(forecast)
+library(lubridate)
+theme_set(theme_bw())
+```
+
+```{r}
+producao <- read.csv("producao.csv", header = T)
+```
+
+```{r}
+producao <- producao |>
+  mutate(data = yearmonth(as.Date(paste(data,"01"), format = "%Y-%m %d"))) |>
+  pivot_longer(cols = Automoveis:Urbano, 
+               names_to = "Tipo", 
+               values_to = "Qtd") |>
+  as_tsibble(index = data, 
+             key = Tipo)
+```
+
+```{r}
+producao <- producao |>
+  mutate(Segmento = case_when(
+    Tipo %in% c("Automoveis", "Comerciaisleves") ~ "Veiculos",
+    Tipo %in% c("Semileve", "Leve", "Medio", "Semipesado", "Pesado") ~ "Caminhoes",
+    Tipo %in% c("Rodoviario", "Urbano") ~ "Onibus"
+  ))
+```
+
+```{r}
+prod_plot <- producao |>
+  mutate(Tipo = recode_factor(Tipo, "Rodoviario" = "Highway", "Urbano" = "Urban", "Comerciaisleves" = "Light comercial", "Automoveis" = "Passenger cars",  "Leve" = "Light", "Semileve" = "Medium light", "Medio" = "Medium", "Semipesado" = "Medium heavy", "Pesado" = "Heavy")) |>
+  mutate(Segmento = recode_factor(Segmento, "Onibus" = "Buses", "Veiculos" = "Cars", "Caminhoes" = "Trucks")) |>
+  mutate(across(!c(data, Qtd), as.factor))
+
+prod_plot |>
+  autoplot(Qtd, aes(color = Tipo)) +
+  facet_wrap(~ Segmento, scales = "free_y", nrow=3) + 
+  theme(legend.title = element_blank()) +
+  # theme(legend.position = "bottom") +
+  labs(x="date [1M]", y="Qtt")
+```
+
+```{r}
+producao |>
+  group_by(Segmento) |>
+  summarise(Qtd = sum(Qtd, na.rm = T)) |>
+  autoplot(Qtd, aes(color = Segmento)) +
+  theme(legend.title = element_blank()) +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+producao |>
+  summarise(Qtd = sum(Qtd, na.rm = T)) |>
+  autoplot(Qtd)
+```
+
+```{r}
+producao_hts <- producao |>
+  aggregate_key(Segmento/Tipo, Qtd = sum(Qtd))
+
+producao_hts <- producao_hts |>
+ mutate(parada_covid = if_else(data >= yearmonth("2020-04") & 
+                                 data <= yearmonth("2020-06"), 
+                                 1, 0))
+```
+
+```{r}
+all_dates <- sort(unique(producao_hts$data))
+N <- length(all_dates)
+
+path <- "Resultados_reconc"
+if(!dir.exists(path)) dir.create(path)
+```
+
+```{r}
+arquivo_csv1 <- file.path(path, "metricas_agg.csv")
+arquivo_csv2 <- file.path(path, "metrics_nagg_segmento.csv")
+arquivo_csv3 <- file.path(path, "metrics_nagg.csv")
+
+
+if (file.exists(arquivo_csv1)) file.remove(arquivo_csv1)
+if (file.exists(arquivo_csv2)) file.remove(arquivo_csv2)
+if (file.exists(arquivo_csv3)) file.remove(arquivo_csv3)
+
+w <- 12 # windows size of rolling forecasting origin 
+
+# for (h in 1:6) { 
+for (h in 1) { ### ATENTION: In the paper we did h=1:6 ###
+  
+  message("=== Horizonte h = ", h, " ===")
+  
+  for (i in (N-w-h+1):(N - h)) {
+    
+    cut_date <- all_dates[i]
+    
+    message("i = ", i, " | cut_date = ", cut_date)
+    
+    train_set <- producao_hts |> 
+      fill_gaps() |>
+      filter(data <= cut_date)
+    
+    test_dates <- all_dates[(i+1):(i+h)]
+    
+    test_set <- producao_hts |> 
+      fill_gaps() |>
+      filter(data %in% test_dates)
+  
+fit_arima <- train_set |>
+  model(base = ARIMA(Qtd ~ parada_covid
+                     )) |>
+  reconcile(
+    bu = bottom_up(base),
+    ols = min_trace(base, method = "ols"),
+    mint = min_trace(base, method = "mint_shrink"),
+    wlsv = min_trace(base, method = "wls_var"),
+    wlss = min_trace(base, method = "wls_struct") #,
+    # mintc = min_trace(base, method = "mint_cov")
+  )
+
+assign(paste0("fit_arima_h", h, "_i", i), fit_arima)
+
+
+fc_arima <- fit_arima |> 
+  forecast(new_data = test_set)
+
+assign(paste0("fc_arima_h", h, "_i", i), fc_arima)
+
+metrics_agg <- fc_arima |>
+  filter(is_aggregated(Tipo), is_aggregated(Segmento)) |>
+  accuracy(
+    data = producao_hts,
+    measures = list(rmse = RMSE, mae = MAE, mape = MAPE)
+  ) |>
+  group_by(.model) |>
+  summarise(armse = mean(rmse, na.rm = TRUE), amae = mean(mae, na.rm = TRUE), amape = mean(mape, na.rm = TRUE),
+            srmse = sd(rmse, na.rm = TRUE), smae = sd(mae, na.rm = TRUE), smape = sd(mape, na.rm = TRUE)) |>
+        mutate(h = h, i = i) 
+
+      write.table(
+        metrics_agg,
+        file = arquivo_csv1,
+        append = TRUE,
+        sep = ",",
+        row.names = FALSE,
+        col.names = !file.exists(arquivo_csv1)
+        )
+
+metrics_nagg_segmento <- fc_arima |>
+  filter(is_aggregated(Tipo), !is_aggregated(Segmento)) |>
+  accuracy(
+    data = producao_hts,
+    measures = list(rmse = RMSE, mae = MAE, mape = MAPE)
+  ) |>
+  group_by(.model) |>
+  summarise(armse = mean(rmse, na.rm = TRUE), amae = mean(mae, na.rm = TRUE), amape = mean(mape, na.rm = TRUE),
+            srmse = sd(rmse, na.rm = TRUE), smae = sd(mae, na.rm = TRUE), smape = sd(mape, na.rm = TRUE)) |>
+        mutate(h = h, i = i) 
+
+      write.table(
+        metrics_nagg_segmento,
+        file = arquivo_csv2,
+        append = TRUE,
+        sep = ",",
+        row.names = FALSE,
+        col.names = !file.exists(arquivo_csv2)
+        )
+
+metrics_nagg <- fc_arima |>
+  filter(!is_aggregated(Tipo), !is_aggregated(Segmento)) |>
+  accuracy(
+    data = producao_hts,
+    measures = list(rmse = RMSE, mae = MAE, mape = MAPE)
+  ) |>
+  group_by(.model) |>
+  summarise(armse = mean(rmse, na.rm = TRUE), amae = mean(mae, na.rm = TRUE), amape = mean(mape, na.rm = TRUE),
+            srmse = sd(rmse, na.rm = TRUE), smae = sd(mae, na.rm = TRUE), smape = sd(mape, na.rm = TRUE)) |>
+        mutate(h = h, i = i) 
+
+      write.table(
+        metrics_nagg,
+        file = arquivo_csv3,
+        append = TRUE,
+        sep = ",",
+        row.names = FALSE,
+        col.names = !file.exists(arquivo_csv3)
+        )
+
+  }
+  
+}
+```
+
+```{r}
+fit_arima_all <- producao_hts |>
+  model(base = ARIMA(Qtd ~ parada_covid
+                     )) |>
+  reconcile(
+    bu = bottom_up(base),
+    ols = min_trace(base, method = "ols"),
+    mint = min_trace(base, method = "mint_shrink"),
+    wlsv = min_trace(base, method = "wls_var"),
+    wlss = min_trace(base, method = "wls_struct") #,
+    # mintc = min_trace(base, method = "mint_cov")
+  )
+```
+
+```{r}
+covid_future <- new_data(producao_hts, 12) |>
+    mutate(parada_covid = 0)
+
+fc_all <- fit_arima_all |> forecast(covid_future)
+```
+
+```{r}
+fc_all |>
+  filter(!is_aggregated(Tipo), !is_aggregated(Segmento)) |>
+  autoplot(
+    producao_hts |> filter_index("2021-01"~.),
+    level = NULL
+  ) +
+  facet_wrap(vars(Segmento), scales = "free_y")
+```
+
+```{r}
+fc_all |>
+  filter(is_aggregated(Tipo), !is_aggregated(Segmento)) |>
+  autoplot(
+    producao_hts |> filter_index("2021-01"~.),
+    level = NULL
+  ) +
+  facet_wrap(vars(Segmento), scales = "free_y")
+```
+
+```{r}
+fc_all |>
+  filter(.model != "base") |>
+  filter(is_aggregated(Tipo), is_aggregated(Segmento)) |>
+  autoplot(
+    producao_hts |> filter_index("2021-01"~.),
+    level = NULL
+  )
+```
+
+```{r}
+all_dates <- sort(unique(producao_hts$data))
+N <- length(all_dates)
+
+path <- "Resultados_RFO3"
+if(!dir.exists(path)) dir.create(path)
+```
+
+```{r}
+arquivo_csv1 <- file.path(path, "metricas_agg.csv")
+arquivo_csv2 <- file.path(path, "metrics_nagg_segmento.csv")
+arquivo_csv3 <- file.path(path, "metrics_nagg.csv")
+
+
+if (file.exists(arquivo_csv1)) file.remove(arquivo_csv1)
+if (file.exists(arquivo_csv2)) file.remove(arquivo_csv2)
+if (file.exists(arquivo_csv3)) file.remove(arquivo_csv3)
+
+w <- 12 # windows size of rolling forecasting origin 
+
+for (h in 1:12) {
+  
+  message("=== Horizonte h = ", h, " ===")
+  
+  for (i in (N-w-h+1):(N - h)) {
+    
+    cut_date <- all_dates[i]
+    
+    message("i = ", i, " | cut_date = ", cut_date)
+    
+    train_set <- producao_hts |> 
+      fill_gaps() |>
+      filter(data <= cut_date)
+    
+    test_dates <- all_dates[(i+1):(i+h)]
+    
+    test_set <- producao_hts |> 
+      fill_gaps() |>
+      filter(data %in% test_dates)
+  
+fit_arima <- train_set |>
+  model(base = prophet(Qtd ~ parada_covid
+                     )) |>
+  reconcile(
+    bu = bottom_up(base),
+    ols = min_trace(base, method = "ols"),
+    mint = min_trace(base, method = "mint_shrink"),
+    wlsv = min_trace(base, method = "wls_var"),
+    wlss = min_trace(base, method = "wls_struct") #,
+    # mintc = min_trace(base, method = "mint_cov")
+  )
+
+assign(paste0("fit_arima_h", h, "_i", i), fit_arima)
+
+
+fc_arima <- fit_arima |> 
+  forecast(new_data = test_set)
+
+assign(paste0("fc_arima_h", h, "_i", i), fc_arima)
+
+metrics_agg <- fc_arima |>
+  filter(is_aggregated(Tipo), is_aggregated(Segmento)) |>
+  accuracy(
+    data = producao_hts,
+    measures = list(rmse = RMSE, mae = MAE, mape = MAPE)
+  ) |>
+  group_by(.model) |>
+  summarise(armse = mean(rmse, na.rm = TRUE), amae = mean(mae, na.rm = TRUE), amape = mean(mape, na.rm = TRUE),
+            srmse = sd(rmse, na.rm = TRUE), smae = sd(mae, na.rm = TRUE), smape = sd(mape, na.rm = TRUE)) |>
+        mutate(h = h, i = i) 
+
+      write.table(
+        metrics_agg,
+        file = arquivo_csv1,
+        append = TRUE,
+        sep = ",",
+        row.names = FALSE,
+        col.names = !file.exists(arquivo_csv1)
+        )
+
+metrics_nagg_segmento <- fc_arima |>
+  filter(is_aggregated(Tipo), !is_aggregated(Segmento)) |>
+  accuracy(
+    data = producao_hts,
+    measures = list(rmse = RMSE, mae = MAE, mape = MAPE)
+  ) |>
+  group_by(.model) |>
+  summarise(armse = mean(rmse, na.rm = TRUE), amae = mean(mae, na.rm = TRUE), amape = mean(mape, na.rm = TRUE),
+            srmse = sd(rmse, na.rm = TRUE), smae = sd(mae, na.rm = TRUE), smape = sd(mape, na.rm = TRUE)) |>
+        mutate(h = h, i = i) 
+
+      write.table(
+        metrics_nagg_segmento,
+        file = arquivo_csv2,
+        append = TRUE,
+        sep = ",",
+        row.names = FALSE,
+        col.names = !file.exists(arquivo_csv2)
+        )
+
+metrics_nagg <- fc_arima |>
+  filter(!is_aggregated(Tipo), !is_aggregated(Segmento)) |>
+  accuracy(
+    data = producao_hts,
+    measures = list(rmse = RMSE, mae = MAE, mape = MAPE)
+  ) |>
+  group_by(.model) |>
+  summarise(armse = mean(rmse, na.rm = TRUE), amae = mean(mae, na.rm = TRUE), amape = mean(mape, na.rm = TRUE),
+            srmse = sd(rmse, na.rm = TRUE), smae = sd(mae, na.rm = TRUE), smape = sd(mape, na.rm = TRUE)) |>
+        mutate(h = h, i = i) 
+
+      write.table(
+        metrics_nagg,
+        file = arquivo_csv3,
+        append = TRUE,
+        sep = ",",
+        row.names = FALSE,
+        col.names = !file.exists(arquivo_csv3)
+        )
+
+  }
+  
+}
+```
+
+```{r}
+prod_hts <- prod_plot |>
+  aggregate_key(Segmento/Tipo, Qtd = sum(Qtd))
+
+prod_hts <- prod_hts |>
+ mutate(parada_covid = if_else(data >= yearmonth("2020-04") & 
+                                 data <= yearmonth("2020-06"), 
+                                 1, 0))
+
+fit_arima <- prod_hts |>
+  model(base = ARIMA(Qtd ~ parada_covid
+                     )) |>
+  reconcile(
+    bu = bottom_up(base),
+    ols = min_trace(base, method = "ols"),
+    mint = min_trace(base, method = "mint_shrink"),
+    wlsv = min_trace(base, method = "wls_var"),
+    wlss = min_trace(base, method = "wls_struct") #,
+    # mintc = min_trace(base, method = "mint_cov")
+  )
+
+future_set <- new_data(prod_hts, 6) |>
+    mutate(parada_covid = 0)
+
+
+fc_arima <- fit_arima |> 
+  forecast(new_data = future_set)
+```
+
+```{r}
+fc_filt <- fc_arima |>
+   filter(is_aggregated(Segmento))
+
+# write.csv(fc_filt, "fc_filt.csv", row.names = F)
+
+prod_filt <- prod_plot |>
+  index_by(data) |>
+  summarise(Qtd = sum(Qtd, na.rm = T))
+
+ggplot() +
+  geom_line(data=fc_filt |> filter(.model != "base"), 
+            mapping=aes(x=data, 
+                        y=.mean, 
+                        col = .model)) +
+  geom_line(data=prod_filt |> filter_index("2021-01"~.), 
+            mapping=aes(x = data, 
+                        y = Qtd)) +
+  labs(y="Production",x="date [1M]")
+```
+
+```{r}
+fc_arima  |> filter(.model != "base") |>
+  filter(Segmento == "Buses") |>
+  autoplot(prod_hts |> filter_index("2021-01"~.), level = NULL) +
+  facet_grid(vars(Tipo),  scales = "free_y") +
+  labs(y="Production",x="date [1M]")
+```
+
+```{r}
+fc_arima |> filter(.model != "base") |>
+  filter(Segmento == "Cars") |>
+  autoplot(prod_hts |> filter_index("2021-01"~.), level = NULL) +
+  facet_grid(vars(Tipo),  scales = "free_y") +
+  labs(y="Production",x="date [1M]")
+```
+
+```{r}
+# fc_arima |>
+#   filter(Segmento == "Trucks") |>
+#   autoplot(prod_hts |> filter_index("2021-01"~.), level = NULL) +
+#   facet_grid(vars(Tipo),  scales = "free_y")
+```
+
+```{r}
+fc_trucks <- fc_arima |>
+  filter(Segmento == "Trucks") |>
+  index_by(data) |>
+  group_by(Tipo, .model) |>
+  summarise(Qtd = sum(.mean, na.rm = TRUE)) |>
+  mutate(Tipo = as.character(Tipo))
+
+trucks_filt <- prod_plot |>
+  filter(Segmento == "Trucks") |>
+  select(!Segmento)
+
+trucks_agregado <- prod_plot |> 
+  filter(Segmento == "Trucks") |> 
+  index_by(data) |> 
+  summarise(
+    Tipo = "<aggregated>",              # nome para o agregado
+    Qtd = sum(Qtd, na.rm = TRUE)
+  )
+
+trucks_filt <- trucks_filt |> 
+  bind_rows(trucks_agregado) |>
+  arrange(Tipo)
+
+ggplot() +
+  geom_line(data = trucks_filt |> filter_index("2021-01"~.), 
+            aes(x = data, y = Qtd)) +
+  geom_line(
+    data = fc_trucks |> filter(.model != "base"),
+    aes(x = data, y = Qtd, color = .model)) +
+  facet_grid(vars(Tipo), scales = "free_y") +
+  labs(y="Production",x="date [1M]")
+```
+
+```{r}
+fc_arima |> filter(.model != "base") |> 
+  filter(.model == "wlsv") |>
+  filter(Segmento == "Buses") |>
+  autoplot(prod_hts |> filter_index("2021-01"~.)) +
+  facet_grid(vars(Tipo),  scales = "free_y") +
+  labs(y="Qtd",x="date [1M]")
+```
