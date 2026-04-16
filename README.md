@@ -1,6 +1,6 @@
 ## Energy demand forecasting through coherent scenarios of production activity of the automotive industry
 
-Repository with code and data for the paper entitled "Energy demand forecasting through coherent scenarios of production activity of the automotive industry" to be published on...
+Repository with code and data for the paper entitled "Energy demand forecasting through coherent scenarios of production activity of the automotive industry" published on IEEE Access.
 
 - Hierarchical automotive industry production data is at "producao.csv".
 - Energy and aggregated production data are found at "industria_auto.csv".
